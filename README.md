@@ -52,8 +52,10 @@ This artifact is a repository that contains the source code of Nos and baselines
 * Run `prepare.sh`.
     * If the cluster size is not 16, run `prepare.sh X` instead, where `X` is the cluster size. For example, run `prepare.sh 7` in a 7-node cluster.
     * There is an immediate confirmation after running `prepare.sh`. Do not leave immediately after running the script.
-      After the confirmation, the script will run for about 15 minutes.
+      After the confirmation, the script will run for about 10 minutes.
 * **Everything is OK!** Go to the `project-nos` directory.
+    * `prepare.sh` will also setup zsh. It is recommended that you use zsh instead of the default bash.
+    * If you use VSCode, the repository also provides a recommended plugin list for you.
 
 ### For others
 

@@ -31,7 +31,7 @@ MAXNODES=${1:-16}
 set -e
 
 echo "-- Project-Nos Setup Script --"
-echo "This script takes around 15 minutes to finish."
+echo "This script takes around 10 minutes to finish."
 echo
 check_yes_no
 
