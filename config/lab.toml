@@ -1,0 +1,24 @@
+[ec]
+k = 3
+p = 1
+
+[nthreads]
+rpc = 10
+ec = 3
+
+[cluster]
+default-port = 31999
+default-cpu = [0, 36]
+
+[[cluster.peers]]
+ip = "10.0.2.172"
+
+[[cluster.peers]]
+ip = "10.0.2.173"
+
+[[cluster.peers]]
+ip = "10.0.2.164"
+
+[[cluster.peers]]
+ip = "10.0.2.165"
+cpu = 0

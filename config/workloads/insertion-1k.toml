@@ -1,0 +1,12 @@
+name = "insertion (1k-val)"
+value_size = 1024
+count = 64
+duration = 60
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 1
+read = 0
+update = 0

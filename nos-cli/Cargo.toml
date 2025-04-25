@@ -1,0 +1,45 @@
+[package]
+name = "nos-cli"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+isal-sys = { path = "../isal-sys" }
+rrppcc = { path = "../rrppcc" }
+nos = { path = "../nos" }
+
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4.2.2", features = ["derive"] }
+quanta = "0.12"
+rand = "0.8"
+rand_distr = "0.4"
+core_affinity = "0.8"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3.28"
+ahash = "0.8"
+regex = "1.11.1"
+crossbeam = "0.8"
+
+hostname = "0.4"
+local-ip-address = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+csv = "1.1"
+signal-hook = "0.3.17"
+
+log = { version = "0.4", features = ["release_max_level_info"] }
+env_logger = "0.11.0"
+
+# Statistics reporter
+[[bin]]
+name = "nos-report-cli"
+path = "src/bin/stat_report.rs"
+
+# Node slowdown invoker
+[[bin]]
+name = "nos-slowdown-cli"
+path = "src/bin/slowdown.rs"

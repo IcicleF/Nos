@@ -1,0 +1,15 @@
+# This workload should only be used to test whether things work.
+# For performance benchmarking, use large workloads.
+
+name = "update-only (1M 1kB-val test)"
+value_size = 1024
+count = 1_000_000
+duration = 20
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 0
+update = 1

@@ -1,0 +1,12 @@
+name = "read-only test (50M 256B-val Zipf-0.99)"
+value_size = 256
+count = 50_000_000
+duration = 20
+
+[distribution]
+zipf = 0.99
+
+[proportion]
+insert = 0
+read = 1
+update = 0

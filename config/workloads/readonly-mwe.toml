@@ -1,0 +1,15 @@
+# This workload should only be used to test whether things work.
+# For performance benchmarking, use large workloads.
+
+name = "MWE read-only test (1K 64B-val)"
+value_size = 64
+count = 1000
+duration = 10
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 1
+update = 0

@@ -1,0 +1,17 @@
+# CloudLab profile, EC(4, 1)
+
+[ec]
+k = 4
+p = 1
+
+[nthreads]
+rpc = 12
+ec = 6
+
+[cluster]
+mode = "auto"
+
+num = 32
+start-ip = "10.0.2.1"
+cpu = [0, 24]
+port = 31890

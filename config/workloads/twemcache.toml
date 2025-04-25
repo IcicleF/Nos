@@ -1,0 +1,15 @@
+name = "twemcache trace"
+duration = 60
+trace = "$HOME/nos-traces/$TRACEFILE.tr"
+
+value_size = 0 # Ignored
+count = 0      # Ignored
+
+[proportion]
+insert = 0
+read = 1
+update = 0
+
+
+[distribution] # Ignored
+uniform = {} # Ignored

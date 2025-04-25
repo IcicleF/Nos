@@ -1,0 +1,12 @@
+name = "update-only test (50M 64B-val)"
+value_size = 64
+count = 50_000_000
+duration = 20
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 0
+update = 1

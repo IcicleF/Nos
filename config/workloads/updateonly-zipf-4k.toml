@@ -1,0 +1,12 @@
+name = "update-only test (50M 4K-val Zipf-0.99)"
+value_size = 4000
+count = 50_000_000
+duration = 20
+
+[distribution]
+zipf = 0.99
+
+[proportion]
+insert = 0
+read = 0
+update = 1

@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "isal-sys",
+    "numa-sys",
+    "rrppcc",
+    "nos",
+    "nos-cli",
+    "trace-preprocess",
+]
+resolver = "2"
+package.rust-version = "1.74.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = true

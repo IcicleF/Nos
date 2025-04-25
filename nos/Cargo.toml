@@ -1,0 +1,99 @@
+[package]
+name = "nos"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Libraries in this repo
+isal-sys = { path = "../isal-sys" }
+rrppcc = { path = "../rrppcc" }
+
+# External libraries, for use in data-plane logic
+anyhow = "1.0"
+thiserror = "1.0"
+clap = { version = "4.2.2", features = ["derive"] }
+futures = "0.3.28"
+dashmap = "6.0.1"
+ahash = "0.8"
+fxhash = "0.2"
+crossbeam = "0.8"
+rand = "0.8"
+rand_distr = "0.4"
+core_affinity = "0.8"
+quanta = "0.12"
+priority-queue = "2.0"
+tokio = { version = "1", features = ["sync"] }
+
+# External libraries, for use in control-plane logic
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+quick-xml = "0.36.1"
+local-ip-address = "0.6"
+uuid = "1.4.1"
+net2 = "0.2.39"
+numa-sys = { path = "../numa-sys" }
+
+# Loggers & allocators
+log = { version = "0.4", features = ["release_max_level_info"] }
+env_logger = "0.11.0"
+jemallocator = "0.5.0"
+jemalloc-ctl = "0.5.0"
+
+[dev-dependencies]
+simple_logger = "5.0.0"
+
+[features]
+default = ["use_ahash"]
+use_fxhash = []
+use_ahash = []
+
+
+# Cluster-to-SSH mapping generator
+[[bin]]
+name = "cluster2ip"
+path = "src/bin/cluster2ip.rs"
+
+# Baselines
+[[bin]]
+name = "bsl-raid"
+path = "src/baselines/raid.rs"
+
+[[bin]]
+name = "bsl-split"
+path = "src/baselines/split.rs"
+
+[[bin]]
+name = "bsl-split-lb"
+path = "src/baselines/split_lb.rs"
+
+[[bin]]
+name = "bsl-repl"
+path = "src/baselines/repl.rs"
+
+[[bin]]
+name = "bsl-cocytus"
+path = "src/baselines/cocytus.rs"
+
+[[bin]]
+name = "bsl-pq"
+path = "src/baselines/pq.rs"
+
+[[bin]]
+name = "bsl-mds"
+path = "src/baselines/mds_sim.rs"
+
+# Below are implemented during revision
+[[bin]]
+name = "bsl-dynbackup"
+path = "src/baselines/dynbackup.rs"
+
+[[bin]]
+name = "bsl-repl-handoff"
+path = "src/baselines/repl_handoff.rs"
+
+[[bin]]
+name = "bsl-split-dyn"
+path = "src/baselines/split_dyn.rs"

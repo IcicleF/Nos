@@ -1,0 +1,18 @@
+# Toy workload for testing degraded reads.
+# - 1K keys to make things work quickly
+# - 128B values to reveal alignment problems
+
+name = "degraded read test (1K 128B-val)"
+value_size = 128
+count = 1000
+duration = 10
+
+faults = [1]
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 1
+update = 0

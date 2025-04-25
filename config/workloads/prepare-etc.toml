@@ -1,0 +1,13 @@
+name = "prepare Facebook ETC (50M, write-intensive)"
+value_size = 4000
+value_pattern = "etc"
+count = 50_000_000
+duration = 0
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 1
+update = 0

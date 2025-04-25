@@ -1,0 +1,1572 @@
+//! Object store functionalities and related definitions.
+//!
+//! Include the object store type and the metadata type.
+
+mod meta;
+mod parity_picker;
+mod rpc_res;
+mod stats;
+
+use std::cell::UnsafeCell;
+use std::hint;
+use std::mem::{self, MaybeUninit};
+use std::ptr;
+use std::sync::{atomic::*, Arc};
+use std::time::Duration;
+
+use anyhow::Result;
+use crossbeam::queue::{ArrayQueue, SegQueue};
+use dashmap::DashMap;
+use futures::{executor::block_on, future::join_all};
+use quanta::Instant;
+use rand::prelude::*;
+use rrppcc::{type_alias::*, *};
+use tokio::sync::RwLock;
+
+use crate::ctrl::Cluster;
+use crate::ec::{isal_wrappings as isal, EcConfig, Sbibd};
+use crate::rpc_types::*;
+use crate::utils::{async_sleep, HashRandomState};
+use crate::Key;
+
+pub use meta::*;
+use parity_picker::*;
+pub use rpc_res::*;
+pub use stats::ObjStoreStats;
+
+thread_local! {
+    /// RPC resources for the current thread.
+    static RESOURCES: UnsafeCell<Option<RpcRes>> = const { UnsafeCell::new(None) };
+}
+
+/// Version number type.
+pub type Version = u32;
+pub type AtomicVersion = AtomicU32;
+
+/// Parity that contains encodee keys and the encoded value.
+#[derive(Debug, Clone)]
+pub struct Parity<K>
+where
+    K: Key,
+{
+    /// Encodees of this parity entry.
+    pub encodees: Vec<K>,
+
+    /// The encoded value, with ownership.
+    pub value: Vec<u8>,
+}
+
+impl<K> Parity<K>
+where
+    K: Key,
+{
+    /// Create a new encoded value.
+    pub fn new(encodees: Vec<K>, value: Vec<u8>) -> Self {
+        Self { encodees, value }
+    }
+}
+
+/// Standalone key-value pair in the key-value store.
+#[derive(Debug, Clone)]
+pub struct StandaloneKv<K>
+where
+    K: Key,
+{
+    /// The key.
+    pub key: K,
+
+    /// The value. Pinned in heap to ensure accessibility via raw pointers.
+    pub value: Vec<u8>,
+}
+
+impl<K> StandaloneKv<K>
+where
+    K: Key,
+{
+    /// Create a new standalone value.
+    pub fn new(key: K, value: Vec<u8>) -> Self {
+        Self { key, value }
+    }
+}
+
+/// Standalone key-value pair in the key-value store, with information about replica locations.
+#[derive(Debug, Clone)]
+pub struct Primary {
+    pub value: Vec<u8>,
+    pub repl_to: Vec<usize>,
+}
+
+impl Primary {
+    /// Create a new primary object with an existing KV pair.
+    pub fn from_kv<K: Key>(kv: StandaloneKv<K>, repl_to: Vec<usize>) -> Self {
+        Self {
+            value: kv.value,
+            repl_to,
+        }
+    }
+
+    /// Create a new primary object.
+    pub fn new(value: Vec<u8>, repl_to: Vec<usize>) -> Self {
+        Self { value, repl_to }
+    }
+}
+
+/// A crafted fat pointer that point to an in-queue KV entry.
+#[derive(Debug, Clone, Copy)]
+pub struct InQueueEntry {
+    ptr: *const u8,
+    len: usize,
+}
+
+impl InQueueEntry {
+    #[inline]
+    pub fn new(ptr: *const u8, len: usize) -> Self {
+        Self { ptr, len }
+    }
+}
+
+/// Key position data.
+struct KeyPos {
+    /// Primary node index.
+    primary: usize,
+
+    /// SBIBD base node index.
+    sbibd_base: usize,
+
+    /// Index within the SBIBD group.
+    index_in_sbibd: usize,
+}
+
+/// Local object store that holds primary and backups of objects.
+pub struct ObjStore<K>
+where
+    K: Key,
+{
+    /// The cluster that this object store is working on.
+    cluster: Cluster,
+    /// EC + SBIBD configuration.
+    ec: Sbibd,
+    /// Simulated node slow-down status. Allocated in `new`.
+    slow_down: Vec<AtomicBool>,
+
+    /// Object store for primaries. Allocated in `new`.
+    primary_store: DashMap<K, Primary, HashRandomState>,
+    /// Object store for parities. Allocated in `new`.
+    parity_store: DashMap<K, Arc<RwLock<Parity<K>>>, HashRandomState>,
+
+    /// An array of waiting queues that hold objects sent to me.
+    /// The `repl_listener` method will take the entries from `repl_meta_bufs`
+    /// and push them into these queues according to their primaries.
+    ///
+    /// The length of this array is equal to the length of `repl_srcs`.
+    /// If `repl_srcs[i] = j`, then `repl_queues[i]` holds objects whose primaries
+    /// are node `j`.
+    repl_queues: Vec<ArrayQueue<StandaloneKv<K>>>,
+    /// An array of parity queues.
+    ///
+    /// Parity queues do not actually own partial parities. Instead, the data
+    /// is stil in `store`. The queues only hold metadata, i.e., encodee keys.
+    /// This simplifies update process.
+    parity_queues: Vec<SegQueue<Vec<K>>>,
+    /// An index that indexes objects in waiting queues.
+    wq_index: DashMap<K, InQueueEntry, HashRandomState>,
+    /// Keys that are suspended in the waiting queues.
+    /// If the object diffs of these keys have a higher version than the stored
+    /// ones, the diffs may not be merged into parities.
+    /// This ensures that degraded reads can get a consistent view of the parity
+    /// and the objects it encoded.
+    suspended_merge: DashMap<K, Version, HashRandomState>,
+
+    /// Flag for halting the object store's listener threads.
+    halt: AtomicBool,
+    /// Performance statistics.
+    #[allow(dead_code)]
+    stats: ObjStoreStats,
+}
+
+/// It should be safe to access `ObjStore` across threads.
+unsafe impl<K> Send for ObjStore<K> where K: Key {}
+unsafe impl<K> Sync for ObjStore<K> where K: Key {}
+
+/// Max value size.
+pub const MAX_VALUE_SIZE: usize = 4000;
+
+impl<K> ObjStore<K>
+where
+    K: Key,
+{
+    /// Initial capacity of the key-value store.
+    pub const INITIAL_MAP_CAPACITY: usize = 1_000_000;
+
+    /// Initial capacity of the waiting queue index.
+    pub const INITIAL_WQ_INDEX_CAPACITY: usize = 1 << 16;
+
+    /// Receive queue length.
+    pub const QUEUE_LEN: usize = 1 << 10;
+
+    /// Create a object store instance.
+    ///
+    /// This instance holds a concurrent key-value store that is used to store
+    /// object data, both primaries and backups.
+    ///
+    /// The replicated objects will be encoded into parities and stored into
+    /// the object store, which is the main design point of Nos. Replica objects
+    /// can come from any node: a client at anywhere can send an object's primary
+    /// to its primary node and send replicas to the backup nodes. Therefore,
+    /// the user needs to specify the *replication sources* that a replica's primary
+    /// can choose from.
+    pub fn new(cluster: &Cluster, ec_config: &EcConfig) -> Arc<Self> {
+        // Find the replication sources
+        let ec = Sbibd::new(ec_config);
+
+        // Make work queues
+        let repl_queues = (0..ec_config.k)
+            .map(|_| ArrayQueue::new(Self::QUEUE_LEN))
+            .collect();
+        let parity_queues = (0..ec_config.k).map(|_| SegQueue::new()).collect();
+
+        Arc::new(Self {
+            cluster: cluster.clone(),
+            ec,
+            slow_down: (0..cluster.size())
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+
+            primary_store: DashMap::with_capacity_and_hasher(
+                Self::INITIAL_MAP_CAPACITY,
+                HashRandomState::default(),
+            ),
+            parity_store: DashMap::with_capacity_and_hasher(
+                Self::INITIAL_MAP_CAPACITY,
+                HashRandomState::default(),
+            ),
+
+            repl_queues,
+            parity_queues,
+            wq_index: DashMap::with_capacity_and_hasher(
+                Self::INITIAL_WQ_INDEX_CAPACITY,
+                HashRandomState::default(),
+            ),
+            suspended_merge: DashMap::with_hasher(HashRandomState::default()),
+
+            halt: AtomicBool::new(false),
+            stats: ObjStoreStats::new(),
+        })
+    }
+
+    /// Notify all the listener threads to stop.
+    pub fn halt(&self) {
+        self.halt.store(true, Ordering::SeqCst);
+    }
+
+    /// Get whether this object store is halted.
+    #[inline(always)]
+    pub fn is_halted(&self) -> bool {
+        self.halt.load(Ordering::Relaxed)
+    }
+
+    /// Get the key position data.
+    #[inline(always)]
+    fn key_pos(&self, key: K) -> KeyPos {
+        let primary = key % self.cluster.size() as u64;
+        let index_in_sbibd = key % self.ec.size() as u64;
+        let sbibd_base = (key - index_in_sbibd) % self.cluster.size() as u64;
+        KeyPos {
+            primary: primary as usize,
+            sbibd_base: sbibd_base as usize,
+            index_in_sbibd: index_in_sbibd as usize,
+        }
+    }
+
+    /// Get a reference to the metadata queue for the given object key.
+    #[inline(always)]
+    fn queue_id(&self, key: K) -> Option<usize> {
+        let KeyPos {
+            sbibd_base,
+            index_in_sbibd,
+            ..
+        } = self.key_pos(key);
+
+        let backup_index = if self.cluster.rank() >= sbibd_base {
+            self.cluster.rank() - sbibd_base
+        } else {
+            self.cluster.rank() + self.cluster.size() - sbibd_base
+        };
+
+        // assert!(
+        //     backup_index < self.ec.size(),
+        //     "invalid backup index {}",
+        //     backup_index
+        // );
+        // self.ec.repl_src_index(backup_index, index_in_sbibd)
+
+        // (backup_index < self.ec.size())
+        //     .then(|| self.ec.repl_src_index(backup_index, index_in_sbibd))
+
+        // FIXME: wrong request dispatch?
+        if backup_index < self.ec.size() {
+            Some(self.ec.repl_src_index(backup_index, index_in_sbibd))
+        } else {
+            Some(0)
+        }
+    }
+
+    /// Insert the given object whose primary is this node into the object store.
+    ///
+    /// # Safety
+    ///
+    /// - `value_addr` must be a valid pointer to a byte array of length `len`.
+    #[inline]
+    pub unsafe fn insert_primary(
+        &self,
+        key: K,
+        value_addr: *const u8,
+        len: usize,
+        repl_to: Vec<usize>,
+    ) {
+        debug_assert_ne!(value_addr, ptr::null(), "value being inserted is null");
+        debug_assert_ne!(
+            repl_to.len(),
+            0,
+            "no replication targets, this is invalid in Nos"
+        );
+
+        let value = {
+            let mut buf = Vec::with_capacity(len);
+            ptr::copy_nonoverlapping(value_addr, buf.as_mut_ptr(), len);
+            buf.set_len(len);
+            buf
+        };
+
+        log::trace!("objstore: insert primary {:?}", key);
+        self.primary_store.insert(key, Primary::new(value, repl_to));
+    }
+
+    /// Insert the given object diff into the object store.
+    /// The object will be pushed into the waiting queue for a background worker to encode it.
+    ///
+    /// # Safety
+    ///
+    /// - `value_addr` must be a valid pointer to a byte array of length `len`.
+    #[inline]
+    pub unsafe fn insert_backup(&self, key: K, value_addr: *const u8, len: usize) -> bool {
+        debug_assert_ne!(value_addr, ptr::null(), "value being inserted is null");
+
+        let value = {
+            let mut buf = Vec::with_capacity(len);
+            ptr::copy_nonoverlapping(value_addr, buf.as_mut_ptr(), len);
+            buf.set_len(len);
+            buf
+        };
+
+        // Value already in memory, so insert into WQ index first
+        self.wq_index
+            .insert(key, InQueueEntry::new(value.as_ptr(), len));
+
+        let Some(qid) = self.queue_id(key) else {
+            return false;
+        };
+
+        // Insert into the waiting queue
+        log::trace!("objstore: insert replica {:?}", key);
+        let rq = &self.repl_queues[qid];
+        let mut val = StandaloneKv::new(key, value);
+        loop {
+            match rq.push(val) {
+                Ok(_) => break true,
+                Err(e) => val = e,
+            }
+        }
+    }
+
+    /// Retrieve a clone of the given primary object from the object store.
+    #[inline]
+    pub fn get_primary(&self, key: K) -> Option<Primary> {
+        self.primary_store
+            .get(&key)
+            .map(|entry| (*entry.value()).clone())
+    }
+
+    /// Determine if the given key is in the parity store or waiting queue.
+    #[inline]
+    pub fn contains_parity(&self, key: K) -> bool {
+        self.parity_store.contains_key(&key) || self.wq_index.contains_key(&key)
+    }
+
+    /// Find an appropriate parity queue for the given partial parity encodee list.
+    fn find_parity_queue(&self, encodee: &[K]) -> usize {
+        debug_assert_ne!(
+            encodee.len(),
+            self.ec.k,
+            "trying to find parity queue for a full parity"
+        );
+        let mut cand = vec![true; self.ec.k];
+        for key in encodee.iter() {
+            let src = self.queue_id(*key).unwrap();
+            cand[src] = false;
+        }
+        cand.into_iter().enumerate().find(|&x| x.1).unwrap().0
+    }
+
+    /// Run a encoder that encodes incoming replicas from different nodes into
+    /// parities and stores them.
+    ///
+    /// **NOTE:** this method is intended to be ran in a separate thread.
+    /// It returns immediately if there are no sources of replication.
+    pub fn encoder(&self) -> Result<()> {
+        // If there are no sources of replication, terminate immediately
+        if self.repl_queues.is_empty() {
+            log::warn!("no replication sources, terminating replica encoder!");
+            return Ok(());
+        }
+
+        // Wait time threshold
+        const WAIT_TIME_THRESHOLD: Duration = Duration::from_micros(10);
+        while !self.halt.load(Ordering::Relaxed) {
+            // Room for new objects
+            let mut new_obj_keys = Vec::with_capacity(self.ec.k);
+            let mut new_obj_values = Vec::with_capacity(self.ec.k);
+
+            // Wait until there is one new object from each replication queue.
+            {
+                let mut id = 0;
+                'collect_objs: while id < self.ec.k {
+                    let rq = &self.repl_queues[id];
+
+                    let wait_start = Instant::now();
+                    let entry = loop {
+                        match rq.pop() {
+                            Some(entry) => {
+                                // Check whether this is a new object; if not, do update.
+                                // TODO: version check
+                                if !self.parity_store.contains_key(&entry.key) {
+                                    break entry;
+                                } else {
+                                    // If the merge of the key is currently suspended, skip it.
+                                    // FIXME: do version check instead of blindly skipping
+                                    if self.suspended_merge.contains_key(&entry.key) {
+                                        let mut entry = entry;
+                                        loop {
+                                            match rq.push(entry) {
+                                                Ok(_) => break,
+                                                Err(e) => entry = e,
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    // No need to use `get_mut`, update atomicity guaranteed by the RwLock.
+                                    let kv = self.parity_store.get(&entry.key).unwrap();
+                                    let mut kv = block_on(kv.value().write());
+                                    debug_assert!(
+                                        kv.encodees.contains(&entry.key),
+                                        "encodee does not match key: {:?} vs {}",
+                                        kv.encodees,
+                                        entry.key
+                                    );
+
+                                    if kv.value.len() < entry.value.len() {
+                                        kv.value.resize(entry.value.len(), 0);
+                                    }
+                                    isal::xor_update(&mut kv.value, &entry.value);
+                                }
+                            }
+                            None => {
+                                // Prevent infinite waiting.
+                                if wait_start.elapsed() >= WAIT_TIME_THRESHOLD {
+                                    id += 1;
+                                    continue 'collect_objs;
+                                }
+                            }
+                        }
+                    };
+
+                    // Check the parity queue; if not empty, XOR merge into it.
+                    if let Some(mut encodee_list) = self.parity_queues[id].pop() {
+                        log::trace!(
+                            "merging key {} into an entry in parity queue {}",
+                            entry.key,
+                            id
+                        );
+                        assert!(!encodee_list.is_empty(), "empty partial parity");
+                        debug_assert!(!encodee_list.contains(&entry.key), "invalid partial parity");
+                        encodee_list.push(entry.key);
+
+                        // Update parity.
+                        let inner = {
+                            let parity = self
+                                .parity_store
+                                .get(&encodee_list[0])
+                                .expect("parity not found");
+                            let kv = parity.value();
+                            {
+                                // Update encodee list.
+                                let mut kv = block_on(kv.write());
+                                kv.encodees.push(entry.key);
+
+                                // Update value.
+                                if kv.value.len() <= entry.value.len() {
+                                    kv.value.resize(entry.value.len(), 0);
+                                }
+                                isal::xor_update(&mut kv.value, &entry.value);
+                            }
+
+                            // Copy inner `Arc` so that we can insert into the store for the new key
+                            kv.clone()
+                        };
+                        self.parity_store.insert(entry.key, inner);
+
+                        // Repush the metadata into an appropriate parity queue, if necessary.
+                        assert!(encodee_list.len() <= self.ec.k);
+                        if encodee_list.len() == self.ec.k {
+                            log::trace!(
+                                "parity <encodee = {:?}> has become a full parity",
+                                encodee_list
+                            );
+                        } else {
+                            let idx = self.find_parity_queue(&encodee_list);
+                            assert_ne!(idx, id, "parity queue unchanged");
+                            self.parity_queues[idx].push(encodee_list);
+                        }
+                        continue;
+                    }
+
+                    new_obj_keys.push(entry.key);
+                    new_obj_values.push(entry.value);
+                    id += 1;
+                }
+            }
+
+            // Do nothing and restart the loop if all queues are skipped.
+            if new_obj_keys.is_empty() {
+                continue;
+            }
+
+            log::trace!("compressing: {:?}", new_obj_keys);
+
+            // Extend the parity to the same size as the largest value.
+            let val_len = new_obj_values.iter().map(|x| x.len()).max().unwrap();
+            for val in new_obj_values.iter_mut() {
+                if val.len() < val_len {
+                    val.resize(val_len, 0);
+                }
+            }
+
+            let encoded_data = {
+                let input = new_obj_values
+                    .iter()
+                    .map(|slice| slice.as_ref())
+                    .collect::<Vec<_>>();
+                let mut data = Vec::with_capacity(val_len);
+                isal::xor_compute(data.spare_capacity_mut(), &input);
+                unsafe { data.set_len(val_len) };
+                data
+            };
+
+            // Let every key in the KvStore point to the same encoded entry
+            let encoded_kv = Arc::new(RwLock::new(Parity::new(new_obj_keys.clone(), encoded_data)));
+            for key in &new_obj_keys {
+                self.parity_store.insert(*key, encoded_kv.clone());
+            }
+
+            // Fence that prevents the removal of WQ index from happening before the insertion
+            // of the encoded entry into the KV store.
+            compiler_fence(Ordering::SeqCst);
+
+            // KV store has the indexes, now can remove them from WQ index
+            for key in &new_obj_keys {
+                self.wq_index.remove(key);
+            }
+
+            // Push the partial parity into a proper parity queue
+            if new_obj_keys.len() < self.ec.k {
+                log::trace!("handling partial parity [encodee = {:?}]", new_obj_keys);
+                let idx = self.find_parity_queue(&new_obj_keys);
+                self.parity_queues[idx].push(new_obj_keys);
+            }
+        }
+        Ok(())
+    }
+
+    /// Degraded read, but must succeed without any recursion. Write value
+    /// into the provided buffer. Return the number of bytes actually written.
+    ///
+    /// The purpose of this seemingly redundant function is mostly to avoid
+    /// Rust's complaint about calling `degraded_read` recursively. The code
+    /// was written before Rust 1.77 and at that time indirected recursive async
+    /// calls were not stable. Now we do not want to modify working code.
+    async fn degraded_read_direct(
+        &self,
+        rpc: &Rpc,
+        key: K,
+        value: &mut [MaybeUninit<u8>],
+    ) -> usize {
+        log::info!("triggered recursive degraded read");
+
+        let primary = (key % self.cluster.size() as u64) as usize;
+        let backups = self.ec.backups_of(primary);
+
+        // Delegate to one who has the parity of the desired object.
+        if !backups.contains(&self.cluster.rank()) || !self.contains_parity(key) {
+            // Contact all backup nodes of this object to query parity metadata
+            let parity_meta_futs = backups
+                .iter()
+                .map(|backup| async {
+                    if *backup == self.cluster.rank() {
+                        // Query local parity store.
+                        match self.parity_store.get(&key) {
+                            Some(kv) => {
+                                let kv = kv.value().read().await;
+                                Some(kv.encodees.clone())
+                            }
+                            None => None,
+                        }
+                    } else if self.cluster[*backup].is_alive() {
+                        let mut req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+                        let mut resp_buf = rpc.alloc_msgbuf(mem::size_of::<K>() * self.ec.k);
+
+                        unsafe {
+                            ptr::write_volatile(
+                                req_buf.as_mut_ptr() as *mut ObjMeta<K>,
+                                ObjMeta::new(key, 0, 0),
+                            )
+                        };
+
+                        // Fetch parity metadata
+                        let sess = RESOURCES.with(|res| {
+                            let res = unsafe { &*res.get() }.as_ref().unwrap();
+                            res.session_to(rpc, *backup)
+                        });
+                        sess.request(RPC_ENCODEE_LIST_FETCH, &req_buf, &mut resp_buf)
+                            .await;
+
+                        let retval = unsafe { *(resp_buf.as_ptr() as *mut u64) };
+                        if retval == 0 {
+                            None
+                        } else {
+                            let encodees = (0..(retval as usize))
+                                .map(|i| unsafe {
+                                    ptr::read(
+                                        resp_buf
+                                            .as_ptr()
+                                            .add(mem::size_of::<u64>() + i * mem::size_of::<K>())
+                                            as *const K,
+                                    )
+                                })
+                                .collect();
+                            Some(encodees)
+                        }
+                    } else {
+                        // Target backup is dead
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let parity_metas = join_all(parity_meta_futs).await;
+
+            // Vec<(node_id, encodee_list)>
+            let parity_metas = backups
+                .iter()
+                .copied()
+                .zip(parity_metas)
+                .filter_map(|(backup, parity)| parity.map(|p| (backup, p)))
+                .collect::<Vec<_>>();
+            debug_assert!(
+                parity_metas.iter().all(|(_, parity)| parity.contains(&key)),
+                "some parity does not contain the desired key"
+            );
+
+            // Pick the best parity to use, which must be directly recoverable
+            assert!(!parity_metas.is_empty());
+            let (backup, parity) = pick_best_parity(key, &parity_metas, &self.cluster);
+            assert!(
+                count_recursive(key, parity, &self.cluster) == 0,
+                "object {} cannot be directly recovered",
+                key
+            );
+
+            log::trace!(
+                "svr {}: delegating degraded read (direct) of {} to svr {}",
+                self.cluster.rank(),
+                key,
+                backup
+            );
+
+            // Delegate the request to the selected backup node
+            let mut req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+            let mut resp_buf = rpc.alloc_msgbuf(mem::size_of::<u64>() + MAX_VALUE_SIZE);
+
+            unsafe {
+                ptr::write_volatile(
+                    req_buf.as_mut_ptr() as *mut ObjMeta<K>,
+                    ObjMeta::new(key, 0, 0),
+                )
+            };
+            let sess = RESOURCES.with(|res| {
+                let res = unsafe { &*res.get() }.as_ref().unwrap();
+                res.session_to(rpc, backup)
+            });
+            sess.request(RPC_DATA_READ, &req_buf, &mut resp_buf).await;
+
+            let retval = unsafe {
+                let len = *(resp_buf.as_ptr() as *mut u64) as usize;
+                ptr::copy_nonoverlapping(
+                    resp_buf.as_ptr().add(mem::size_of::<u64>()),
+                    value.as_mut_ptr() as _,
+                    len,
+                );
+                len
+            };
+            return retval;
+        }
+
+        // Here, I definitely hold the parity.
+        // Check WQ first, and if exists I can directly return
+        if let Some(entry) = self.wq_index.get(&key) {
+            let entry = entry.value();
+            let len = entry.len;
+            unsafe {
+                ptr::copy_nonoverlapping(entry.ptr, value.as_mut_ptr() as _, len);
+            }
+            return len;
+        }
+
+        // WQ not found, must be encoded, so read from objstore.
+        let (encodees, len) = {
+            let Some(kv) = self.parity_store.get(&key) else {
+                panic!(
+                    "parity of {} on node {} not found",
+                    key,
+                    self.cluster.rank()
+                )
+            };
+            let kv = kv.value().read().await;
+
+            // If in the store is a partial parity that only encodes this object, then
+            // the parity itself is the object.
+            if kv.encodees.len() == 1 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        kv.value.as_ptr(),
+                        value.as_mut_ptr() as _,
+                        kv.value.len(),
+                    );
+                }
+                return kv.value.len();
+            }
+            (kv.encodees.clone(), kv.value.len())
+        };
+
+        // Suspend diff merging of the keys in this parity
+        for key in &encodees {
+            self.suspended_merge.insert(*key, 0);
+        }
+
+        // Read all the encodees. No one can be missing.
+        let encodee_futs = encodees
+            .iter()
+            .filter(|k| **k != key)
+            .map(|encodee_key| async {
+                let primary = ((*encodee_key) % self.cluster.size() as u64) as usize;
+                if primary == self.cluster.rank() {
+                    match self.get_primary(*encodee_key) {
+                        Some(sa) => sa.value,
+                        None => panic!("encodee {} not found", *encodee_key),
+                    }
+                } else {
+                    let req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+                    let mut resp_buf = rpc.alloc_msgbuf(mem::size_of::<u64>() + MAX_VALUE_SIZE);
+                    unsafe {
+                        ptr::write_volatile(
+                            req_buf.as_ptr() as *mut ObjMeta<K>,
+                            ObjMeta::new(*encodee_key, 0, 0),
+                        )
+                    };
+                    let sess = RESOURCES.with(|res| {
+                        let res = unsafe { &*res.get() }.as_ref().unwrap();
+                        res.session_to(rpc, primary)
+                    });
+                    sess.request(RPC_DATA_READ, &req_buf, &mut resp_buf).await;
+
+                    let len = unsafe { *(resp_buf.as_ptr() as *mut u64) } as usize;
+                    assert!(len != 0, "encodee {} not found", *encodee_key);
+                    unsafe {
+                        let mut value = Vec::with_capacity(len);
+                        ptr::copy_nonoverlapping(
+                            resp_buf.as_ptr().add(mem::size_of::<u64>()),
+                            value.as_mut_ptr(),
+                            len,
+                        );
+                        value.set_len(len);
+                        value
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut encodee_values = join_all(encodee_futs).await;
+        assert!(!encodee_values.is_empty(), "no encodees retrieved");
+
+        // FIXME: use correct fetched version.
+        for key in &encodees {
+            self.suspended_merge.insert(*key, 1);
+        }
+
+        // FIXME: currently, we fetch the value instantly.
+        //        we should wait until the parity has exactly the same versions with the encodees, should use await to yield out.
+        let Some(kv) = self.parity_store.get(&key) else {
+            panic!(
+                "parity of {} on node {} not found",
+                key,
+                self.cluster.rank()
+            )
+        };
+        let kv = kv.value().read().await;
+
+        // Decode the object
+        for val in &mut encodee_values {
+            val.resize(len, 0);
+        }
+        let mut xor_input = encodee_values
+            .iter()
+            .map(|v| v.as_ref())
+            .collect::<Vec<_>>();
+        xor_input.push(kv.value.as_ref());
+        isal::xor_compute(value, &xor_input);
+
+        drop(kv);
+
+        // Cancel the suspension
+        for key in &encodees {
+            self.suspended_merge.remove(key);
+        }
+
+        len
+    }
+
+    /// Degraded read. Write value into the provided buffer.
+    /// Return the number of bytes actually written.
+    async fn degraded_read(&self, rpc: &Rpc, key: K, value: &mut [u8]) -> usize {
+        let primary = (key % self.cluster.size() as u64) as usize;
+        let backups = self.ec.backups_of(primary);
+
+        // Delegate to one who has the parity of the desired object if I am not the right one
+        if !backups.contains(&self.cluster.rank()) || !self.contains_parity(key) {
+            // Contact all backup nodes of this object to query parity metadata
+            let parity_meta_futs = backups
+                .iter()
+                .map(|backup| async {
+                    if *backup == self.cluster.rank() {
+                        // Query local key-value store.
+                        match self.parity_store.get(&key) {
+                            Some(kv) => {
+                                let kv = kv.value().read().await;
+                                Some(kv.encodees.clone())
+                            }
+                            None => None,
+                        }
+                    } else if self.cluster[*backup].is_alive() {
+                        let req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+                        let mut resp_buf = rpc
+                            .alloc_msgbuf(mem::size_of::<u64>() + mem::size_of::<K>() * self.ec.k);
+                        unsafe {
+                            ptr::write_volatile(
+                                req_buf.as_ptr() as *mut ObjMeta<K>,
+                                ObjMeta::new(key, 0, 0),
+                            )
+                        };
+
+                        // Fetch parity metadata
+                        let sess = RESOURCES.with(|res| {
+                            let res = unsafe { &*res.get() }.as_ref().unwrap();
+                            res.session_to(rpc, *backup)
+                        });
+                        sess.request(RPC_ENCODEE_LIST_FETCH, &req_buf, &mut resp_buf)
+                            .await;
+
+                        let retval = unsafe { *(resp_buf.as_ptr() as *mut u64) };
+                        if retval == 0 {
+                            None
+                        } else {
+                            let encodees = (0..(retval as usize))
+                                .map(|i| unsafe {
+                                    ptr::read(
+                                        resp_buf
+                                            .as_ptr()
+                                            .add(mem::size_of::<u64>() + i * mem::size_of::<K>())
+                                            as *const K,
+                                    )
+                                })
+                                .collect();
+                            Some(encodees)
+                        }
+                    } else {
+                        // Target backup is dead
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let parity_metas = join_all(parity_meta_futs).await;
+
+            // Vec<(node_id, encodee_list)>
+            let parity_metas = backups
+                .iter()
+                .copied()
+                .zip(parity_metas)
+                .filter_map(|(backup, parity)| parity.map(|p| (backup, p)))
+                .collect::<Vec<_>>();
+
+            if parity_metas.is_empty() {
+                return 0;
+            }
+
+            debug_assert!(
+                parity_metas.iter().all(|(_, parity)| parity.contains(&key)),
+                "some parity does not contain the desired key"
+            );
+
+            // Pick the best parity to use.
+            debug_assert!(!parity_metas.is_empty());
+            let (backup, _) = pick_best_parity(key, &parity_metas, &self.cluster);
+
+            log::trace!(
+                "svr {}: delegating degraded read of {} to svr {}",
+                self.cluster.rank(),
+                key,
+                backup,
+            );
+
+            // Delegate the request to the selected backup node
+            let mut req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+            let mut resp_buf = rpc.alloc_msgbuf(mem::size_of::<u64>() + MAX_VALUE_SIZE);
+
+            unsafe {
+                ptr::write_volatile(
+                    req_buf.as_mut_ptr() as *mut ObjMeta<K>,
+                    ObjMeta::new(key, 0, 0),
+                )
+            };
+            let sess = RESOURCES.with(|res| {
+                let res = unsafe { &*res.get() }.as_ref().unwrap();
+                res.session_to(rpc, backup)
+            });
+            sess.request(RPC_DATA_READ, &req_buf, &mut resp_buf).await;
+
+            let retval = unsafe {
+                let len = *(resp_buf.as_ptr() as *mut u64) as usize;
+                assert!(
+                    len <= value.len(),
+                    "value buffer too small: {} vs {}",
+                    value.len(),
+                    len
+                );
+                ptr::copy_nonoverlapping(
+                    resp_buf.as_ptr().add(mem::size_of::<u64>()),
+                    value.as_mut_ptr() as _,
+                    len,
+                );
+                len
+            };
+            return retval;
+        }
+
+        // Here, I definitely hold the parity.
+        // Check WQ first, and if exists I can directly return
+        if let Some(entry) = self.wq_index.get(&key) {
+            let entry = entry.value();
+            let len = entry.len;
+            unsafe { ptr::copy_nonoverlapping(entry.ptr, value.as_mut_ptr() as _, len) };
+            return len;
+        }
+
+        // WQ not found, must be encoded, so read from parity store.
+        let (encodees, len) = {
+            let Some(kv) = self.parity_store.get(&key) else {
+                panic!(
+                    "parity of {} on node {} not found",
+                    key,
+                    self.cluster.rank()
+                )
+            };
+            let kv = kv.value().read().await;
+
+            // If in the store is a partial parity that only encodes this object, then
+            // the parity itself is the object.
+            if kv.encodees.len() == 1 {
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        kv.value.as_ptr(),
+                        value.as_mut_ptr() as _,
+                        kv.value.len(),
+                    );
+                }
+                return kv.value.len();
+            }
+            (kv.encodees.clone(), kv.value.len())
+        };
+        debug_assert!(!encodees.is_empty(), "encodee list is empty");
+        debug_assert!(
+            encodees.contains(&key),
+            "encodee list does not contain the key"
+        );
+
+        // Suspend diff merging of the keys in this parity
+        for key in &encodees {
+            self.suspended_merge.insert(*key, 0);
+        }
+
+        // Read all the encodees. For those missing, call this function recursively.
+        let encodee_futs = encodees
+            .iter()
+            .filter(|k| **k != key)
+            .map(|encodee_key| async {
+                let primary = ((*encodee_key) % self.cluster.size() as u64) as usize;
+                if primary == self.cluster.rank() {
+                    match self.get_primary(*encodee_key) {
+                        Some(sa) => sa.value,
+                        None => panic!("encodee {} not found", *encodee_key),
+                    }
+                } else {
+                    let mut req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len());
+                    let mut resp_buf = rpc.alloc_msgbuf(mem::size_of::<u64>() + MAX_VALUE_SIZE);
+                    unsafe {
+                        ptr::write_volatile(
+                            req_buf.as_mut_ptr() as *mut ObjMeta<K>,
+                            ObjMeta::new(*encodee_key, 0, 0),
+                        )
+                    };
+
+                    // Encodees can be directly fetched if their primaries are alive, or
+                    // must also go through a degraded-read if their primaries are dead.
+                    if self.cluster[primary].is_alive() {
+                        // Normal read.
+                        let sess = RESOURCES.with(|res| {
+                            let res = unsafe { &*res.get() }.as_ref().unwrap();
+                            res.session_to(rpc, primary)
+                        });
+                        sess.request(RPC_DATA_READ, &req_buf, &mut resp_buf).await;
+
+                        let len = unsafe { *(resp_buf.as_ptr() as *const u64) } as usize;
+                        assert!(len != 0, "encodee {} not found", *encodee_key);
+                        unsafe {
+                            let mut value = Vec::with_capacity(len);
+                            ptr::copy_nonoverlapping(
+                                resp_buf.as_ptr().add(mem::size_of::<u64>()),
+                                value.as_mut_ptr(),
+                                len,
+                            );
+                            value.set_len(len);
+                            value
+                        }
+                    } else {
+                        // Recursive degraded read.
+                        let mut value = Vec::with_capacity(MAX_VALUE_SIZE);
+                        let len = self
+                            .degraded_read_direct(rpc, *encodee_key, value.spare_capacity_mut())
+                            .await;
+                        unsafe { value.set_len(len) };
+                        value
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut encodee_values = join_all(encodee_futs).await;
+        assert!(!encodee_values.is_empty(), "no encodees retrieved");
+
+        // FIXME: use correct fetched version
+        for key in &encodees {
+            self.suspended_merge.insert(*key, 1);
+        }
+
+        // FIXME: currently, we fetch the value instantly.
+        //        we should wait until the parity has exactly the same versions with the encodees, should use await to yield out
+        let Some(kv) = self.parity_store.get(&key) else {
+            panic!(
+                "parity of {} on node {} not found",
+                key,
+                self.cluster.rank()
+            )
+        };
+        let kv = kv.value().read().await;
+
+        // Decode the object
+        for val in &mut encodee_values {
+            val.resize(len, 0);
+        }
+        let mut xor_input = encodee_values
+            .iter()
+            .map(|v| v.as_ref())
+            .collect::<Vec<_>>();
+        xor_input.push(kv.value.as_ref());
+        isal::xor_compute(unsafe { mem::transmute(value) }, &xor_input);
+
+        drop(kv);
+
+        // Cancel the suspension
+        for key in &encodees {
+            self.suspended_merge.remove(key);
+        }
+
+        len
+    }
+
+    /// Recovery RPC request handler callback.
+    ///
+    /// Response format:
+    /// - [0..8]: Return value.
+    ///   - for [`RPC_ENCODEE_LIST_FETCH`], 0 means not-found, otherwise success
+    ///     and means the length of the encodee list.
+    /// - [8..]:  Return payload.
+    #[inline]
+    pub async fn recovery_rpc_handler(&self, req: RequestHandle) -> MsgBuf {
+        #[derive(Debug)]
+        struct ParityData<K>
+        where
+            K: Key,
+        {
+            encodees: Vec<K>,
+            value_ptr: *const u8,
+            value_len: usize,
+        }
+
+        // Check liveness
+        if !self.cluster.me().is_alive() {
+            log::warn!(
+                "logically-dead node {} is handling RPC, this must be rare or something is wrong!",
+                self.cluster.rank()
+            );
+        }
+
+        // Check request sanity
+        debug_assert!(
+            (BEGIN_RECOVERY_RPC..=END_RECOVERY_RPC).contains(&req.req_type()),
+            "RPC type {} incorrectly handled by `recovery_rpc_handler`",
+            req.req_type()
+        );
+
+        let req_buf = req.req_buf();
+        debug_assert!(
+            req_buf.len() >= mem::size_of::<ObjMeta<K>>(),
+            "request too short ({} bytes) to contain a full header",
+            req_buf.len()
+        );
+
+        // SAFETY:
+        // - Clients definitely send a header at the beginning of the request
+        // - Data validity is ensured by NIC
+        // - There is enough space for the header (checked by the assertion)
+        let hdr = unsafe { <ObjMeta<K>>::from_ptr(req_buf.as_ptr()) };
+
+        let mut resp_buf = req.pre_resp_buf();
+        let retval = resp_buf.as_ptr() as *mut u64;
+        let resp_payload = unsafe { resp_buf.as_mut_ptr().add(mem::size_of::<u64>()) };
+
+        // Try fetch the parity from both objstore and WQ.
+        let entry = self.parity_store.get(&hdr.key);
+        let _guard;
+        let kv;
+
+        if let Some(ref kv_instore) = entry {
+            // Got entry from the local object store.
+            let kv_rg = kv_instore.value().read().await;
+            kv = ParityData {
+                encodees: kv_rg.encodees.clone(),
+                value_ptr: kv_rg.value.as_ptr(),
+                value_len: kv_rg.value.len(),
+            };
+            debug_assert!(
+                kv.encodees.contains(&hdr.key),
+                "encodee list does not contain the key"
+            );
+
+            // Take the guard to ensure concurrency safety
+            _guard = Some(kv_rg);
+        } else {
+            // No entry in local object store, try WQ.
+            let kv_inqueue = self.wq_index.get(&hdr.key);
+            if let Some(val) = kv_inqueue {
+                kv = ParityData {
+                    encodees: vec![hdr.key],
+                    value_ptr: val.ptr,
+                    value_len: val.len,
+                };
+            } else {
+                // No entry found, just return.
+                unsafe { *retval = 0 };
+                resp_buf.set_len(mem::size_of::<u64>());
+                return resp_buf;
+            }
+            _guard = None;
+        }
+
+        // log::info!(
+        //     "svr {}: query of parity for key {} -> {:?}",
+        //     self.cluster.rank(),
+        //     hdr.key,
+        //     kv
+        // );
+
+        let resp_payload_len = if req.req_type() == RPC_ENCODEE_LIST_FETCH {
+            // Copy encodee list into response payload
+            let encodees = &kv.encodees;
+            unsafe { *retval = encodees.len() as u64 };
+            for (i, encodee) in encodees.iter().enumerate() {
+                unsafe {
+                    let ptr = resp_payload.add(i * mem::size_of::<K>());
+                    ptr::write_volatile(ptr as *mut K, *encodee);
+                }
+            }
+            encodees.len() * mem::size_of::<K>()
+        } else if req.req_type() == RPC_PARITY_READ {
+            // Copy data into response payload
+            debug_assert!(kv.value_len != 0);
+            unsafe {
+                ptr::copy_nonoverlapping(kv.value_ptr, resp_payload, kv.value_len);
+                *retval = kv.value_len as u64;
+            }
+            kv.value_len
+        } else {
+            // SAFETY: all possible RPC types are handled
+            unsafe { hint::unreachable_unchecked() };
+        };
+
+        resp_buf.set_len(resp_payload_len + mem::size_of::<u64>());
+        resp_buf
+    }
+
+    /// Normal-case (non-recovery) RPC request handler callback.
+    /// Note that degraded read is also handled here since it is only read, not
+    /// anything recovery-specific.
+    ///
+    /// Response format:
+    /// - [0..8]: Return value.
+    ///   - for writes, 0 means success, otherwise failure.
+    ///   - for reads, 0 means key not found, otherwise the length of the value.
+    /// - [8..(8 + Retval)]: Value for read requests.
+    #[inline]
+    pub async fn rpc_handler(&self, req: RequestHandle) -> MsgBuf {
+        let rpc = req.rpc();
+
+        // Check request sanity
+        debug_assert!(
+            (BEGIN_DATA_RPC..=END_DATA_RPC).contains(&req.req_type()),
+            "RPC type {} incorrectly handled by `rpc_handler`",
+            req.req_type()
+        );
+        debug_assert_ne!(
+            req.req_type(),
+            RPC_DATA_SPLIT_READ,
+            "data split request sent to non EC-Split baseline"
+        );
+
+        // Get request header and determine request type.
+        let req_buf = req.req_buf();
+        assert!(
+            req_buf.len() >= mem::size_of::<ObjMeta<K>>(),
+            "request too short ({} bytes) to contain a full header",
+            req_buf.len()
+        );
+
+        // SAFETY:
+        // - Clients definitely send a header at the beginning of the request.
+        // - Data validity is ensured by NIC.
+        // - There is enough space for the header (checked by the assertion).
+        let hdr = unsafe { <ObjMeta<K>>::from_ptr(req_buf.as_ptr()) };
+        debug_assert!(
+            req.req_type() != RPC_DATA_WRITE || hdr.len > 0,
+            "empty write request"
+        );
+
+        // Get key position data.
+        let KeyPos {
+            primary,
+            sbibd_base,
+            index_in_sbibd,
+        } = self.key_pos(hdr.key);
+
+        // Response payload length, excluding the return value.
+        let mut resp_buf = req.pre_resp_buf();
+        let resp_payload_len;
+        let mut backup_write_ok = true;
+
+        // If this request is a write from a client (i.e., key primary is this node), we need to perform replication.
+        // Backup nodes receiving the same request will find that they are not the primary, and thus skip this step.
+        if req.req_type() == RPC_DATA_WRITE {
+            // Simulate slow down.
+            if self.slow_down[self.cluster.rank()].load(Ordering::Relaxed) {
+                // Simulate slow down.
+                async_sleep(Duration::from_millis(1)).await;
+            }
+
+            if req_buf.len() < <ObjMeta<K>>::len() + hdr.len as usize {
+                log::warn!(
+                    "request too short: {} vs {} (header 16 + payload {}), ignored!",
+                    req_buf.len(),
+                    <ObjMeta<K>>::len() + hdr.len as usize,
+                    hdr.len
+                );
+                resp_buf.set_len(32);
+                let retval = resp_buf.as_mut_ptr() as *mut u64;
+                unsafe { *retval = 0 };
+                return resp_buf;
+            }
+
+            if primary == self.cluster.rank() {
+                // PRIMARY WRITE
+                // Prepare for replication.
+                let mut repl_to = Vec::with_capacity(self.ec.p + 1);
+                let mut repl_targets = self
+                    .ec
+                    .backups_of(index_in_sbibd)
+                    .iter()
+                    .map(|&i| (sbibd_base + i) % self.cluster.size())
+                    .filter(|&i| self.cluster[i].is_alive())
+                    .collect::<Vec<_>>();
+                debug_assert!(
+                    repl_targets.len() > self.ec.p,
+                    "not enough living backup nodes"
+                );
+
+                // If there are enough fast nodes, only replicate to them.
+                {
+                    let fast_repl_targets = repl_targets
+                        .iter()
+                        .filter(|&i| !self.slow_down[*i].load(Ordering::Relaxed))
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if fast_repl_targets.len() > self.ec.p {
+                        repl_targets = fast_repl_targets;
+                    }
+                }
+
+                // Compute diff if this is an update.
+                let diff = self.primary_store.get(&hdr.key).map(|v| {
+                    // This is an update, so compute the diff and copy `repl_to`.
+                    repl_to.clone_from(&v.repl_to);
+                    let old_val = &v.value;
+
+                    // Do XOR only for the common part.
+                    let min_len = old_val.len().min(hdr.len as usize);
+                    let mut diff = Vec::with_capacity(hdr.len as usize);
+                    isal::xor_compute(
+                        &mut diff.spare_capacity_mut()[..min_len],
+                        &[&old_val[..min_len], unsafe {
+                            &req_buf.as_slice()
+                                [<ObjMeta<K>>::len()..(min_len + <ObjMeta<K>>::len())]
+                        }],
+                    );
+
+                    // Copy the rest of the value if it has grown larger.
+                    if hdr.len as usize > min_len {
+                        unsafe {
+                            ptr::copy_nonoverlapping(
+                                req_buf.as_ptr().add(<ObjMeta<K>>::len() + min_len),
+                                diff.as_mut_ptr().add(min_len) as *mut _,
+                                hdr.len as usize - min_len,
+                            )
+                        };
+                    }
+
+                    unsafe { diff.set_len(hdr.len as usize) };
+                    diff
+                });
+
+                // This is a new object, so initialize `repl_to` for it.
+                if diff.is_none() {
+                    debug_assert!(repl_to.is_empty());
+
+                    // Randomize replication targets.
+                    let samples = rand::seq::index::sample(
+                        &mut thread_rng(),
+                        repl_targets.len(),
+                        self.ec.p + 1,
+                    );
+                    repl_to.extend(samples.into_iter().map(|i| repl_targets[i]));
+                };
+                debug_assert!(repl_to.len() == self.ec.p + 1);
+
+                // Perform replication.
+                // 1. Allocate message buffers.
+                let mut repl_req_buf = rpc.alloc_msgbuf(<ObjMeta<K>>::len() + hdr.len as usize);
+                unsafe {
+                    // Copy header -- this is the same as the original request to me.
+                    ptr::write_volatile(repl_req_buf.as_ptr() as *mut _, hdr);
+
+                    // Copy payload.
+                    // Only the first `hdr.len` bytes are updated, so only copy those.
+                    ptr::copy_nonoverlapping(
+                        match &diff {
+                            Some(v) => v.as_ptr() as _,
+                            None => req_buf.as_ptr().add(<ObjMeta<K>>::len()),
+                        },
+                        repl_req_buf.as_mut_ptr().add(<ObjMeta<K>>::len()),
+                        hdr.len as usize,
+                    );
+                }
+
+                let mut repl_resp_bufs = (0..=self.ec.p)
+                    .map(|_| rpc.alloc_msgbuf(mem::size_of::<u64>() * 2))
+                    .collect::<Vec<_>>();
+
+                // 2. Prepare sessions.
+                let sessions = (0..=self.ec.p)
+                    .map(|i| {
+                        let node_id = repl_to[i];
+                        debug_assert_ne!(node_id, self.cluster.rank(), "replicating to self");
+                        RESOURCES.with(|res| {
+                            let res = unsafe { &*res.get() }.as_ref().unwrap();
+                            res.session_to(rpc, node_id)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                // 3. Make async requests.
+                let mut repl_futs = Vec::with_capacity(self.ec.p + 1);
+                let mut resp_buf_slice = &mut repl_resp_bufs[..];
+                for i in 0..=self.ec.p {
+                    let sess = &sessions[i];
+                    let nested_resp_buf = {
+                        let (head, tail) = resp_buf_slice.split_first_mut().unwrap();
+                        resp_buf_slice = tail;
+                        head
+                    };
+                    repl_futs.push(sess.request(RPC_DATA_WRITE, &repl_req_buf, nested_resp_buf));
+                }
+
+                // 4. Insert locally to hide some latency.
+                // SAFETY: the value should be valid.
+                unsafe {
+                    self.insert_primary(
+                        hdr.key,
+                        req_buf.as_ptr().add(<ObjMeta<K>>::len()),
+                        hdr.len as usize,
+                        repl_to.clone(),
+                    )
+                };
+
+                // 5. Concurrently wait for all replication requests to finish.
+                join_all(repl_futs).await;
+
+                // DEBUG: check if the replication is successful
+                // for (i, resp_buf) in repl_resp_bufs.iter().enumerate() {
+                //     if resp_buf.len() != mem::size_of::<u64>() {
+                //         assert!(resp_buf.len() == mem::size_of::<K>() + 5);
+                //         let backup_key = unsafe { ptr::read(resp_buf.as_ptr() as *mut K) };
+                //         panic!(
+                //             "error: primary {} -> backup {}: key {} (backup saw {}, primary {}), sbibd base {}, sbibd index {}",
+                //             self.cluster.rank(), repl_to[i],
+                //             hdr.key, backup_key, backup_key % self.cluster.size() as u64,
+                //             sbibd_base, index_in_sbibd
+                //         );
+                //     }
+                // }
+            } else {
+                // BACKUP WRITE (value is diff!)
+                // SAFETY: the value should be valid.
+                backup_write_ok = unsafe {
+                    self.insert_backup(
+                        hdr.key,
+                        req_buf.as_ptr().add(<ObjMeta<K>>::len()),
+                        hdr.len as usize,
+                    )
+                };
+            }
+            resp_payload_len = 0;
+        } else if req.req_type() == RPC_DATA_READ {
+            if primary == self.cluster.rank() {
+                // PRIMARY READ
+                // Directly query the key-value store.
+                resp_payload_len = match self.primary_store.get(&hdr.key) {
+                    Some(sa) => {
+                        let (addr, len) = (sa.value.as_ptr(), sa.value.len());
+                        if len > resp_buf.capacity() - mem::size_of::<u64>() {
+                            resp_buf = rpc.alloc_msgbuf(len + mem::size_of::<u64>());
+                        }
+
+                        unsafe {
+                            let resp_payload = resp_buf.as_mut_ptr().add(mem::size_of::<u64>());
+                            ptr::copy_nonoverlapping(addr, resp_payload, len);
+                        }
+                        len
+                    }
+                    None => 0,
+                };
+            } else if !self.cluster[primary].is_alive() {
+                // DEGRADED READ
+                log::trace!("handling degraded read of key {}", hdr.key);
+                resp_payload_len = self
+                    .degraded_read(rpc, hdr.key, unsafe {
+                        &mut resp_buf.as_mut_slice()[mem::size_of::<u64>()..]
+                    })
+                    .await;
+            } else {
+                resp_payload_len = 0;
+            }
+        } else {
+            // SAFETY: all possible RPC types (read & write) are handled.
+            unsafe { hint::unreachable_unchecked() };
+        }
+
+        // Set the return value.
+        if backup_write_ok {
+            resp_buf.set_len(resp_payload_len + mem::size_of::<u64>());
+            let retval = resp_buf.as_ptr() as *mut u64;
+            unsafe { *retval = resp_payload_len as u64 };
+        } else {
+            resp_buf.set_len(mem::size_of::<K>() + 5);
+            unsafe { ptr::write(resp_buf.as_ptr() as _, hdr.key) };
+            unsafe { ptr::write(resp_buf.as_ptr().add(mem::size_of::<K>()) as _, hdr.ver) };
+        }
+        resp_buf
+    }
+
+    /// Control-plane RPC request handler callback.
+    /// Different from data RPCs and recovery RPCs, control-plane RPCs return
+    /// immediately with no return values.
+    pub fn ctrl_rpc_handler(&self, req: &RequestHandle) {
+        // Check request sanity
+        debug_assert!(
+            (BEGIN_CONTROL_RPC..=END_CONTROL_RPC).contains(&req.req_type()),
+            "RPC type {} incorrectly handled by `ctrl_rpc_handler`",
+            req.req_type()
+        );
+
+        // Get request header and determine request type.
+        let req_buf = req.req_buf();
+        if req.req_type() == RPC_HALT {
+            self.halt();
+        } else {
+            debug_assert!(
+                req_buf.len() >= mem::size_of::<u64>(),
+                "request too short ({} bytes) to contain a peer ID",
+                req_buf.len()
+            );
+
+            // SAFETY: the request buffer is long enough to contain a u64.
+            let peer_id = unsafe { *(req_buf.as_ptr() as *const u64) } as usize;
+            match req.req_type() {
+                RPC_MAKE_ALIVE => self.cluster[peer_id].make_alive(),
+                RPC_MAKE_FAILED => self.cluster[peer_id].make_failed(),
+                RPC_MAKE_SLOWED => self.slow_down[peer_id].store(true, Ordering::Relaxed),
+                RPC_MAKE_SLOW_RECOVERED => self.slow_down[peer_id].store(false, Ordering::Relaxed),
+                RPC_REPORT_STATS => self.stats.report(),
+                _ => {}
+            };
+        }
+    }
+
+    /// Prepare RPC resources for the current thread.
+    ///
+    /// # Safety
+    ///
+    /// - This method must be called once and only once.
+    /// - This method must be called before running RPC server on the current thread.
+    pub async unsafe fn prepare_rpc(&self, rpc: &Rpc, rpc_id: RpcId) {
+        if RESOURCES.with(|res| unsafe { (*res.get()).is_some() }) {
+            return;
+        }
+        let resource = RpcRes::new(rpc, &self.cluster, rpc_id).await;
+        RESOURCES.with(move |res| (&mut *res.get()).insert(resource));
+    }
+}

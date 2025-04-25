@@ -1,0 +1,20 @@
+# Yahoo! Cloud System Benchmark
+# Workload B: Read mostly workload
+#   Application example: photo tagging; add a tag is an update, but most operations are to read tags
+#                        
+#   Read/update ratio: 95/5
+#   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
+#   Request distribution: zipfian
+
+name = "YCSB-B (50M)"
+value_size = 1024
+count = 50_000_000
+duration = 60
+
+[distribution]
+zipf = 0.99
+
+[proportion]
+insert = 0
+read = 0.95
+update = 0.05

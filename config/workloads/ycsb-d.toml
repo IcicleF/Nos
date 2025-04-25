@@ -1,0 +1,20 @@
+# Yahoo! Cloud System Benchmark
+# Workload D: Read latest workload
+#   Application example: user status updates; people want to read the latest
+#                        
+#   Read/update/insert ratio: 95/0/5
+#   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
+#   Request distribution: latest
+
+name = "YCSB-D (50M)"
+value_size = 1024
+count = 50_000_000
+duration = 60
+
+[distribution]
+zipf = 0.99
+
+[proportion]
+insert = 0.05
+read = 0.95
+update = 0

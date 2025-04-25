@@ -1,0 +1,18 @@
+# CloudLab profile, EC(5, x)
+# for sensitivity test only
+
+[ec]
+k = 5
+p = 4
+
+[nthreads]
+rpc = 12
+ec = 6
+
+[cluster]
+mode = "auto"
+
+num = 31
+start-ip = "10.0.2.1"
+cpu = [0, 24]
+port = 31890

@@ -1,0 +1,6 @@
+[submodule "ff-sbibd"]
+	path = ff-sbibd
+	url = https://github.com/IcicleF/ff-sbibd.git
+[submodule "isal-sys/isa-l"]
+	path = isal-sys/isa-l
+	url = https://github.com/intel/isa-l.git

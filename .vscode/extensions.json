@@ -1,0 +1,15 @@
+{
+    "recommendations": [
+        "ms-vscode.cpptools-extension-pack",
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "editorconfig.editorconfig",
+        "eamodio.gitlens",
+        "github.copilot",
+        "grapecity.gc-excelviewer",
+        "fill-labs.dependi",
+        "mechatroner.rainbow-csv"
+    ]
+}

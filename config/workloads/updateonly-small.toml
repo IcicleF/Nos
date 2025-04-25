@@ -1,0 +1,15 @@
+# This workload should only be used to test whether things work.
+# For performance benchmarking, use large workloads.
+
+name = "small test (1K 64B-val)"
+value_size = 64
+count = 1000
+duration = 20
+
+[distribution]
+uniform = {}
+
+[proportion]
+insert = 0
+read = 0
+update = 1
