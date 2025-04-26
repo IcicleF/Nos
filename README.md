@@ -68,8 +68,7 @@ This artifact is a repository that contains the source code of Nos and baselines
     * If you don't want to do so, you may need to [tweak the cluster and workload configurations](#modifying-cluster-configuration).
 * Clone the repository and make sure that it is shared by NFS over the entire cluster. **Other nodes must have write permission to the repository directory over NFS!**
 * Go to the cloned repository and test if `cargo build` succeeds.
-* Run `scripts/distribute-traces
-* Modify `MAXNODE` in [scripts/dist-cli/run-prepare.sh](scripts/dist-cli/run-prepare.sh) and [scripts/utils/kill.sh](scripts/utils/kill.sh) to your cluster size **minus one**.
+* Run `scripts/distribute-traces.sh`. It assumes the dataset in `/dataset` (at filesystem root, not project directory!), so modify it if needed.
 * **Everything should be OK now!** 
 
 
