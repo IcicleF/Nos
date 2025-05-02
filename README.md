@@ -128,6 +128,8 @@ Please refer to [nos-cli/src/workload/defs.rs](nos-cli/src/workload/defs.rs) for
 Go to `scripts/ae-functional` and run `run-all.sh`.
 It will run a subset of the experiments presented in the paper (covering all figures) and will take ~70 minutes to finish.
 
+The results will be in `ae-data/`.
+
 ### Reproducing the results
 
 > The reproduced badge is not request by the authors.
