@@ -5,8 +5,16 @@ Welcome to the artifact repository of the OSDI'25 accepted paper: _Stripeless Da
 > **To AE reviewers:** Should there be any questions, please contact the authors in HotCRP.
 > The authors will respond to each question as soon as possible and not later than 24 hours.
 >
-> The authors expect that they will prepare an AE testbed on CloudLab during kick-the-tires response period (May 5, 2025 - May 12, 2025). 
-> Details will be on HotCRP.
+> **Kick-the-tires response period testbed:** The authors has prepared an AE testbed on CloudLab during kick-the-tires response period (May 5, 2025 - May 12, 2025). 
+> Please post your public key on the HotCRP (if that's unavailable, please file an issue in this repo).
+> The authors will install it ASAP. After that, please login to the testbed with:
+>
+> ```shell
+> ssh gaoj20@amd250.utah.cloudlab.us
+> ```
+> 
+> Then, please `cd` to `/users/gaoj20/project-nos` and start evaluating our artifact by first [running an MWE]((#minimum-working-example-mwe).
+> 
 > Before or after that period, we kindly ask the reviewer to create testbeds manually.
 
 ## Table of Content
