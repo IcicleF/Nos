@@ -13,7 +13,7 @@ Welcome to the artifact repository of the OSDI'25 accepted paper: _Stripeless Da
 > ssh gaoj20@amd250.utah.cloudlab.us
 > ```
 > 
-> Then, please `cd` to `/users/gaoj20/project-nos` and start evaluating our artifact by first [running an MWE]((#minimum-working-example-mwe).
+> Then, please `cd` to `/users/gaoj20/project-nos` and start evaluating our artifact by first [running an MWE](#minimum-working-example-mwe).
 > 
 > Before or after that period, we kindly ask the reviewer to create testbeds manually.
 
