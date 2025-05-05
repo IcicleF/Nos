@@ -6,7 +6,7 @@ Welcome to the artifact repository of the OSDI'25 accepted paper: _Stripeless Da
 > The authors will respond to each question as soon as possible and not later than 24 hours.
 >
 > **Kick-the-tires response period testbed:** The authors has prepared an AE testbed on CloudLab during kick-the-tires response period (May 5, 2025 - May 12, 2025). 
-> Please post your public key on the HotCRP (if that's unavailable, please file an issue in this repo).
+> Please post your public key on the HotCRP.
 > The authors will install it ASAP. After that, please login to the testbed with:
 >
 > ```shell
