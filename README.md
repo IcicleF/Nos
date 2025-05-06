@@ -5,7 +5,7 @@ Welcome to the artifact repository of the OSDI'25 accepted paper: _Stripeless Da
 > **To AE reviewers:** Should there be any questions, please contact the authors in HotCRP.
 > The authors will respond to each question as soon as possible and not later than 24 hours.
 >
-> **Kick-the-tires response period testbed:** The authors has prepared an AE testbed on CloudLab during kick-the-tires response period (May 5, 2025 - May 12, 2025). 
+> **Kick-the-tires response period testbed:** The authors have prepared an AE testbed on CloudLab during kick-the-tires response period (May 5, 2025 - May 12, 2025). 
 > Please post your public key on HotCRP.
 > The authors will install it ASAP. After that, please login to the testbed with:
 >
@@ -131,7 +131,7 @@ Please refer to [nos-cli/src/workload/defs.rs](nos-cli/src/workload/defs.rs) for
 
 > Request badges for OSDI'25 AE: **Artifact Functional**
 
-Go to `scripts/ae-functional` and run `run-all.sh`.
+Go to `scripts/ae-reproduced` and run `run-all.sh`.
 It will run a subset of the experiments presented in the paper (covering all figures) and will take ~70 minutes to finish.
 
 The results will be in `ae-data/`.
