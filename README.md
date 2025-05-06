@@ -53,9 +53,7 @@ This artifact is a repository that contains the source code of Nos and baselines
 * Create an experiment profile with [scripts/cloudlab/profile.py](scripts/cloudlab/profile.py).
     * You may also directly use the profile link: https://www.cloudlab.us/p/dandelion/c6525-flex
 * Reserve nodes on CloudLab and instantiate an experiment.
-    * To reproduce the experiments, **16 c6525-100g nodes are necessary.**
-    * To verify the functionalties, 7 c6525-25g nodes are enough.
-        * It is possible to use even fewer nodes or other node types (**RDMA NICs are necessary!**), but in that case you must [tweak the configurations](#tweaking-nic-name-or-port-id).
+    * To reproduce the experiments, **16 c6525-100g nodes are necessary. The AE scripts will assume that there are 16 nodes!**
 * On `node0` of your experiment, create a `prepare.sh` in your home directory. Copy the contents of [scripts/cloudlab/prepare.sh](scripts/cloudlab/prepare.sh) in it.
 * Run `prepare.sh`.
     * If the cluster size is not 16, run `prepare.sh X` instead, where `X` is the cluster size. For example, run `prepare.sh 7` in a 7-node cluster.
