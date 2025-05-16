@@ -153,3 +153,15 @@ You can also directly read the code -- they are well documented.
 
 If you are only interested in our RDMA/RPC engine, please refer to their documentation: [rrddmma](https://docs.rs/rrddmma), [rrppcc](https://docs.rs/rrppcc).
 They are still immature and under development, and there might be significant API changes in the future!
+
+
+## Cite Our Paper
+
+Jian Gao, Bin Yan, Jiwu Shu, Yuhao Zhang, Keji Huang. 
+Stripeless Data Placement for Erasure-Coded In-Memory Storage. 
+In *the 19th USENIX Symposium on Operating Systems Design and Implementation* (OSDI), 2025.
+https://www.usenix.org/conference/osdi25/presentation/gao
+
+## Acknowledgment
+
+We thank [CloudLab](https://cloudlab.us) for facilitating this research and its staff for their support.
