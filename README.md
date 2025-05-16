@@ -157,7 +157,7 @@ They are still immature and under development, and there might be significant AP
 
 ## Cite Our Paper
 
-Jian Gao, Bin Yan, Jiwu Shu, Yuhao Zhang, Keji Huang. 
+Jian Gao, Jiwu Shu, Bin Yan, Yuhao Zhang, Keji Huang. 
 Stripeless Data Placement for Erasure-Coded In-Memory Storage. 
 In *the 19th USENIX Symposium on Operating Systems Design and Implementation* (OSDI), 2025.
 https://www.usenix.org/conference/osdi25/presentation/gao
